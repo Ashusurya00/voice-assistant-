@@ -1,0 +1,327 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>JARVIS+ (AudioWorklet fixed)</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+        body {
+            font-family: Segoe UI, Arial;
+            background: #071021;
+            color: #e6f7ff;
+            padding: 30px
+        }
+
+        .card {
+            max-width: 900px;
+            margin: 0 auto;
+            display: flex;
+            gap: 20px
+        }
+
+        .left {
+            width: 40%;
+            background: rgba(255, 255, 255, 0.03);
+            padding: 20px;
+            border-radius: 12px
+        }
+
+        .right {
+            flex: 1;
+            background: rgba(255, 255, 255, 0.03);
+            padding: 20px;
+            border-radius: 12px;
+            min-height: 400px;
+            overflow: auto
+        }
+
+        button {
+            margin: 6px;
+            padding: 10px 16px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer
+        }
+
+        .record {
+            background: #ff5a5a;
+            color: #fff
+        }
+
+        .stop {
+            background: #333;
+            color: #fff
+        }
+
+        .send {
+            background: #0077ff;
+            color: #fff
+        }
+
+        .log {
+            font-size: 14px;
+            color: #cfefff
+        }
+    </style>
+</head>
+
+<body>
+    <h1>JARVIS+ (AudioWorklet - fixed recorder)</h1>
+    <div class="card">
+        <div class="left">
+            <div style="text-align:center;margin-bottom:12px">
+                <div
+                    style="width:120px;height:120px;border-radius:50%;margin:0 auto;background:linear-gradient(#00b3ff,#0066ff);display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700">
+                    J+</div>
+            </div>
+            <button id="recordBtn" class="record">● Record</button>
+            <button id="stopBtn" class="stop">■ Stop</button>
+            <button id="sendBtn" class="send">Send to Jarvis</button>
+            <div style="margin-top:12px">
+                <button id="playBtn">▶ Play Reply</button>
+                <button id="downloadBtn">⬇ Download Reply</button>
+            </div>
+            <div style="margin-top:14px;color:#9fbac6;font-size:13px">Debug:</div>
+            <pre id="debug" class="log"></pre>
+        </div>
+
+        <div class="right">
+            <div id="timeline" class="log"></div>
+        </div>
+    </div>
+
+    <script>
+        /*
+          Client logic:
+          - Loads recorderWorklet.js
+          - Creates AudioWorkletNode and receives Float32Array buffers via port.onmessage
+          - Collects Float32 chunks, converts to Int16 PCM, encodes WAV
+          - Sends to /process, receives reply and audio_base64, plays and allows download
+        */
+
+        let audioCtx = null;
+        let workletNode = null;
+        let mediaStream = null;
+        let floatChunks = []; // array of Float32Array
+        let sampleRate = 44100; // will be updated from audioCtx.sampleRate
+        let replyBlob = null;
+
+        const debugEl = document.getElementById('debug');
+        const timeline = document.getElementById('timeline');
+
+        function logDebug(msg) {
+            const ts = new Date().toLocaleTimeString();
+            debugEl.textContent = `[${ts}] ${msg}\n` + debugEl.textContent;
+        }
+
+        function timelineLog(msg) {
+            const el = document.createElement('div');
+            el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            timeline.prepend(el);
+        }
+
+        // start recording
+        document.getElementById('recordBtn').onclick = async () => {
+            try {
+                // ensure previous resources are cleaned
+                if (audioCtx) {
+                    try { audioCtx.close(); } catch (e) { }
+                    audioCtx = null;
+                }
+                floatChunks = [];
+
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                sampleRate = audioCtx.sampleRate;
+                logDebug('AudioContext created. sampleRate=' + sampleRate);
+
+                // load worklet
+                await audioCtx.audioWorklet.addModule('/static/recorderWorklet.js');
+                logDebug('Worklet module loaded');
+
+                // get mic stream
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const source = audioCtx.createMediaStreamSource(mediaStream);
+
+                // create node
+                workletNode = new AudioWorkletNode(audioCtx, 'recorder-processor');
+                workletNode.port.onmessage = (ev) => {
+                    // ev.data is an ArrayBuffer containing Float32 PCM
+                    const f32 = new Float32Array(ev.data);
+                    floatChunks.push(f32);
+                    // optionally show amplitude
+                    let max = 0;
+                    for (let i = 0; i < f32.length; i++) { const v = Math.abs(f32[i]); if (v > max) max = v; }
+                    logDebug('Received block samples=' + f32.length + ' maxAmp=' + max.toFixed(3));
+                };
+
+                source.connect(workletNode);
+                // we don't need to connect workletNode to destination (no playback)
+                // but some browsers need it connected; connect then disconnect after a short time:
+                try { workletNode.connect(audioCtx.destination); } catch (e) { }
+                timelineLog('Recording started...');
+                logDebug('Recorder started');
+            } catch (err) {
+                logDebug('Start error: ' + err);
+                timelineLog('Recording start failed: ' + err);
+            }
+        };
+
+        // stop recording
+        document.getElementById('stopBtn').onclick = () => {
+            try {
+                if (workletNode) {
+                    try { workletNode.disconnect(); } catch (e) { }
+                    try { workletNode.port.close(); } catch (e) { }
+                }
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(t => t.stop());
+                    mediaStream = null;
+                }
+                if (audioCtx) {
+                    // keep audioCtx open — close on next start to re-create fresh
+                    // audioCtx.close();
+                }
+                timelineLog('Recording stopped.');
+                logDebug('Recorder stopped. chunks=' + floatChunks.length);
+            } catch (e) {
+                logDebug('Stop error: ' + e);
+            }
+        };
+
+        // helper: flatten Float32Array chunks to single Float32Array
+        function flattenFloat32(chunks) {
+            let total = 0;
+            for (let c of chunks) total += c.length;
+            const out = new Float32Array(total);
+            let offset = 0;
+            for (let c of chunks) {
+                out.set(c, offset);
+                offset += c.length;
+            }
+            return out;
+        }
+
+        // float32 -> 16-bit PCM
+        function floatTo16BitPCM(float32Array) {
+            const l = float32Array.length;
+            const buffer = new ArrayBuffer(l * 2);
+            const view = new DataView(buffer);
+            let offset = 0;
+            for (let i = 0; i < l; i++) {
+                let s = Math.max(-1, Math.min(1, float32Array[i]));
+                view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+                offset += 2;
+            }
+            return new Int16Array(buffer);
+        }
+
+        // encode WAV (16-bit PCM)
+        function encodeWAV(int16Array, sampleRate) {
+            const bytesPerSample = 2;
+            const blockAlign = bytesPerSample * 1;
+            const buffer = new ArrayBuffer(44 + int16Array.length * 2);
+            const view = new DataView(buffer);
+
+            function writeString(offset, str) {
+                for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+            }
+
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + int16Array.length * 2, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true); // subchunk1size
+            view.setUint16(20, 1, true); // PCM
+            view.setUint16(22, 1, true); // channels
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * blockAlign, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, 16, true);
+            writeString(36, 'data');
+            view.setUint32(40, int16Array.length * 2, true);
+
+            // write samples
+            let offset = 44;
+            for (let i = 0; i < int16Array.length; i++, offset += 2) {
+                view.setInt16(offset, int16Array[i], true);
+            }
+
+            return new Blob([view], { type: 'audio/wav' });
+        }
+
+        // send to server
+        document.getElementById('sendBtn').onclick = async () => {
+            try {
+                timelineLog('Preparing audio to send...');
+                if (floatChunks.length === 0) {
+                    timelineLog('No audio captured (chunks=0). Check mic permission and that you actually spoke.');
+                    logDebug('No chunks to send.');
+                    return;
+                }
+
+                const flat = flattenFloat32(floatChunks);
+                logDebug('Total samples=' + flat.length + ' sampleRate=' + sampleRate);
+
+                const int16 = floatTo16BitPCM(flat);
+                logDebug('Int16 length=' + int16.length);
+
+                const wavBlob = encodeWAV(int16, sampleRate);
+
+                // debug: create URL and show size
+                const url = URL.createObjectURL(wavBlob);
+                logDebug('WAV blob size=' + wavBlob.size + ' bytes (objectURL created)');
+
+                // Save locally preview (optional)
+                // const a = document.createElement('a'); a.href=url; a.download='debug.wav'; a.click();
+
+                // send to server
+                const fd = new FormData();
+                fd.append('audio_data', wavBlob, 'input.wav');
+
+                timelineLog('Sending audio to Jarvis...');
+                const res = await fetch('/process', { method: 'POST', body: fd });
+                if (!res.ok) {
+                    const txt = await res.text();
+                    timelineLog('Server returned error: ' + txt);
+                    return;
+                }
+                const j = await res.json();
+
+                timelineLog('You said: ' + (j.transcript || '(empty)'));
+                timelineLog('Jarvis: ' + j.reply);
+
+                // prepare reply audio
+                if (j.audio_base64) {
+                    const bytes = atob(j.audio_base64);
+                    const arr = new Uint8Array(bytes.length);
+                    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+                    replyBlob = new Blob([arr], { type: 'audio/wav' });
+
+                    document.getElementById('playBtn').onclick = () => {
+                        const u = URL.createObjectURL(replyBlob);
+                        new Audio(u).play();
+                    };
+                    document.getElementById('downloadBtn').onclick = () => {
+                        const a = document.createElement('a');
+                        a.href = URL.createObjectURL(replyBlob);
+                        a.download = 'reply.wav';
+                        a.click();
+                    };
+                    logDebug('Reply audio ready. size=' + replyBlob.size);
+                }
+            } catch (err) {
+                logDebug('Send error: ' + err);
+                timelineLog('Send failed: ' + err);
+            }
+        };
+
+        // utility: check mic permission explicitly
+        navigator.permissions && navigator.permissions.query({ name: 'microphone' }).then(p => {
+            logDebug('Microphone permission state: ' + p.state);
+            p.onchange = () => logDebug('Microphone permission changed: ' + p.state);
+        }).catch(() => { });
+    </script>
+</body>
+
+</html>
